@@ -42,7 +42,6 @@ await vkApi.AuthorizeAsync(new ApiAuthParams()
     Login = configuration["Vk:Login"],
     Password = configuration["Vk:Password"],
     ApplicationId = ulong.Parse(configuration["Vk:ApplicationId"]!),
-    Settings = Settings.All
 });
 
 tgBot.StartReceiving(new TelegramBotUpdateHandler(tgBot, vkApi, vkGroupUpdateWatcher));
@@ -151,7 +150,7 @@ class TelegramBotUpdateHandler : IUpdateHandler
 
         _groupToChatsBindings.AddOrUpdate(
             group.Id, 
-            groupId => new ConcurrentBag<long>(new long[]{ 1, 1}), 
+            groupId => new ConcurrentBag<long>(new long[]{ chat.Id }), 
             (groupId, chatIds) => 
             { 
                 chatIds.Add(chat.Id); 
@@ -163,7 +162,7 @@ class TelegramBotUpdateHandler : IUpdateHandler
         await botClient.SendTextMessageAsync(chat, $"This Chat Binded To Group: {group.Name}.", cancellationToken: cancellationToken);
     }
 
-    private async Task OnNewPostAsync(long groupId, WallPost post)
+    private async Task OnNewPostAsync(long groupId, Post post)
     {
         ConcurrentBag<long>? chatIds; 
 
@@ -177,11 +176,13 @@ class TelegramBotUpdateHandler : IUpdateHandler
     }
 }
 
-public delegate Task NewPostHanblerAsyncDelegate(long groupId, WallPost post);
+public delegate Task NewPostHanblerAsyncDelegate(long groupId, Post post);
 
 class VkGroupUpdateWatcher
 {
-    private readonly ConcurrentDictionary<long, string> _groupsToWatch = new();
+    private const int PostsPerRequest = 10;
+
+    private readonly ConcurrentDictionary<long, long?> _groupsToWatch = new();
     private readonly ConcurrentBag<NewPostHanblerAsyncDelegate> _newPostHandlers = new();
     private readonly VkApi _vkApi;
 
@@ -194,12 +195,16 @@ class VkGroupUpdateWatcher
         long groupId, 
         CancellationToken cancellationToken)
     {
-        LongPollServerResponse response = 
-            await _vkApi.Groups.GetLongPollServerAsync(
-                groupId: (ulong)groupId, 
-                token: cancellationToken);
+        WallGetObject wall = await _vkApi.Wall.GetAsync(new WallGetParams
+        {
+            OwnerId = -groupId,
+            Offset = 0,
+            Count = 1
+        }, token: cancellationToken);
 
-        AddOrUpdateTs(groupId, response.Ts);
+        Post? firstPost = wall.WallPosts.FirstOrDefault();
+
+        AddOrUpdateGroupToWatch(groupId, firstPost?.Id);
     }
 
     public void AddOnNewPostHandler(NewPostHanblerAsyncDelegate handler)
@@ -211,38 +216,61 @@ class VkGroupUpdateWatcher
     {
         while (!cancellationToken.IsCancellationRequested)
         {
-            if (_groupsToWatch.IsEmpty)
-            {
-                await Task.Delay(1, cancellationToken);           
-                continue;
-            }
+            await Task.Delay(TimeSpan.FromSeconds(1));
 
-            foreach ((long groupId, string ts) in _groupsToWatch)
-                await GetUpdatesAndHanbleAsync(groupId, ts, cancellationToken);
+            if (_groupsToWatch.IsEmpty)
+                continue;
+
+            foreach ((long groupId, long? lastPostId) in _groupsToWatch)
+                await GetUpdatesAndHanbleAsync(groupId, lastPostId, cancellationToken);
         }
     }
 
-    private async Task GetUpdatesAndHanbleAsync(long groupId, string ts, CancellationToken cancellationToken)
+    private async Task GetUpdatesAndHanbleAsync(long groupId, long? lastPostId, CancellationToken cancellationToken)
     {
-        BotsLongPollHistoryResponse response = await _vkApi.Groups
-            .GetBotsLongPollHistoryAsync(new BotsLongPollHistoryParams
-            {
-                Ts = ts,
-            }, token: cancellationToken);
+        IEnumerable<Post> newPosts = await GetNewPostsAsync(groupId, lastPostId, cancellationToken);
 
-        AddOrUpdateTs(groupId, ts);
-
-        IEnumerable<WallPost> newPosts = response.Updates
-            .Where(x => x.Type.Value is GroupUpdateType.WallPostNew)
-            .Cast<WallPost>();
-
-        foreach (WallPost post in newPosts)
+        foreach (Post post in newPosts)
             foreach (NewPostHanblerAsyncDelegate handler in _newPostHandlers)
                 await handler(groupId, post);
     }
 
-    private void AddOrUpdateTs(long groupId, string ts)
+    private async Task<IEnumerable<Post>> GetNewPostsAsync(long groupId, long? lastPostId, CancellationToken cancellationToken)
     {
-        _groupsToWatch.AddOrUpdate(groupId, _ => ts, (_, _) => ts);
+        bool isLastPostEncountered = false;
+        LinkedList<Post> newPosts = new();
+
+        for (var offset = 0ul; !isLastPostEncountered; offset += PostsPerRequest)
+        {
+            WallGetObject wall = await _vkApi.Wall.GetAsync(new WallGetParams
+            {
+                OwnerId = -groupId,
+                Offset = offset,
+                Count = PostsPerRequest
+            }, token: cancellationToken);
+
+
+            foreach (Post post in wall.WallPosts)
+            {
+                if (post.Id == lastPostId)
+                {
+                    isLastPostEncountered = true;
+                    break;
+                }
+
+                Log.Information($"Post: {post.Text}");
+                newPosts.AddLast(post);
+            }
+        }
+
+        if (newPosts.First is not null)
+            AddOrUpdateGroupToWatch(groupId, newPosts.First.Value.Id);
+
+        return newPosts;
+    }
+
+    private void AddOrUpdateGroupToWatch(long groupId, long? lastPostId)
+    {
+        _groupsToWatch.AddOrUpdate(groupId, _ => lastPostId, (_, _) => lastPostId);
     }
 }
