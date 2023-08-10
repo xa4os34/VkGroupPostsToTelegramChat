@@ -15,8 +15,6 @@ using VkNet;
 using VkNet.Enums.Filters;
 using VkNet.Model;
 using VkNet.Exception;
-using VkUpdateType = VkNet.Model.UpdateType;
-using VkNet.Enums.StringEnums;
 
 Log.Logger = new LoggerConfiguration()
     .WriteTo.Console()
